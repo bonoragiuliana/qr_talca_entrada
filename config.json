@@ -1,1 +1,6 @@
-{"producto": "SODA 500CC * 12 PET  (ID: 417)", "cantidad": 2}
+{
+  "producto": "SODA 500CC * 12 PET  (ID: 417)",
+  "cantidad": 2,
+  "gen_producto": "TALCA LIMA LIMON PT 2,25L DESC*6U  (ID: 5205)",
+  "gen_cantidad": 10
+}
