@@ -6,7 +6,5 @@
     "user": "postgres",
     "password": "Talca2025",
     "client_encoding": "WIN1252"
-  },
-  "gen_producto": "SIFON SODA TALCA 2 LT PET*6U (ID: 4910)",
-  "gen_cantidad": 2
+  }
 }
