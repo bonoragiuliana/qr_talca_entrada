@@ -2,13 +2,11 @@ import os
 import sys
 import json
 import textwrap
-import sqlite3
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import urllib.request
 import urllib.error
 
-import pandas as pd
 import qrcode
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
@@ -16,6 +14,16 @@ from reportlab.pdfgen import canvas
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 from tkinter import messagebox, filedialog, ttk
+
+# ----------------------------
+#   POSTGRES DRIVER
+# ----------------------------
+try:
+    import psycopg2
+    from psycopg2.extras import Json
+except Exception:
+    psycopg2 = None
+    Json = None
 
 
 # =======================
@@ -28,18 +36,29 @@ def get_app_dir():
 
 
 APP_DIR = get_app_dir()
-
-EXCEL_PATH = os.path.join(APP_DIR, "productos.xlsx")
-HOJA_PRODUCTOS = "productos"
 CACHE_FILE = os.path.join(APP_DIR, "config.json")
-DB_PATH = os.path.join(APP_DIR, "talca_qr.db")
-
 
 # =======================
 #   GOOGLE SHEETS (WEBHOOK)
 # =======================
-SHEETS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycby1SckKP_PFOFs_ynw1yVnyxCnuJsvf3hi0jX92egBRLb3IHDkkitEyWLbk_II-A-_h/exec"
+SHEETS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbz3HnhMu8ylXKtiEVvcsIRc_VKJzxUQHotKDOHT74QgTgLIVbJPPiX3eJBly368Ad4/exec"
 SHEETS_API_KEY = "TALCA-QR-2026"  # Debe coincidir con API_KEY en Apps Script
+
+# =======================
+#   POSTGRES DEFAULTS
+# =======================
+DEFAULT_PG = {
+    "host": os.getenv("TALCA_PG_HOST", "localhost"),
+    "port": int(os.getenv("TALCA_PG_PORT", "5432")),
+    "dbname": os.getenv("TALCA_PG_DB", "postgres"),
+    "user": os.getenv("TALCA_PG_USER", "postgres"),
+    "password": os.getenv("TALCA_PG_PASS", ""),
+    "client_encoding": os.getenv("TALCA_PG_ENCODING", ""),  # opcional
+    "schema": "stock",
+    "table_products": "productos",
+    "table_pp": "stock_pp",
+    "table_outbox": "sheets_outbox",
+}
 
 
 # =======================
@@ -61,6 +80,21 @@ def save_cache(data: dict):
             json.dump(data, f, ensure_ascii=False, indent=2)
     except:
         pass
+
+
+def get_pg_config():
+    cfg = DEFAULT_PG.copy()
+    cache = load_cache()
+    if isinstance(cache.get("pg"), dict):
+        for k, v in cache["pg"].items():
+            if v is not None and v != "":
+                cfg[k] = v
+    # normalizar port por si viene string en json
+    try:
+        cfg["port"] = int(cfg["port"])
+    except:
+        cfg["port"] = 5432
+    return cfg
 
 
 # =======================
@@ -95,71 +129,244 @@ def normalize_date_iso(s: str) -> str:
 
 
 # =======================
-#   SQLITE
+#   POSTGRES
 # =======================
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
+def pg_connect():
+    """
+    ✅ Conecta a PostgreSQL usando config.json (sección pg)
+    ✅ Aplica client_encoding si está definido (ej: WIN1252)
+    """
+    if psycopg2 is None:
+        raise RuntimeError("Falta psycopg2. Instalá con: pip install psycopg2-binary")
 
-    cur.execute("PRAGMA journal_mode=WAL;")
-    cur.execute("PRAGMA synchronous=NORMAL;")
-
-    # Base de scans
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS pallet_scans (
-        descripcion   TEXT NOT NULL,
-        nro_serie     INTEGER NOT NULL,
-        id_producto   TEXT NOT NULL,
-        lote          TEXT NOT NULL,
-        creacion      TEXT NOT NULL,
-        vencimiento   TEXT NOT NULL,
-        UNIQUE(id_producto, nro_serie, lote)
+    cfg = get_pg_config()
+    conn = psycopg2.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        dbname=cfg["dbname"],
+        user=cfg["user"],
+        password=cfg["password"],
     )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_lote ON pallet_scans(lote)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_id_producto ON pallet_scans(id_producto)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_nro_serie ON pallet_scans(nro_serie)")
+    conn.autocommit = True
 
-    # Estado por pallet (completo/parcial + packs)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS pallet_status (
-        id_producto   TEXT NOT NULL,
-        lote          TEXT NOT NULL,
-        nro_serie     INTEGER NOT NULL,
-        is_full       INTEGER NOT NULL,   -- 1 completo / 0 parcial
-        packs_partial INTEGER NOT NULL,   -- packs si parcial, 0 si completo
-        updated_at    TEXT NOT NULL,
-        UNIQUE(id_producto, lote, nro_serie)
-    )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_status_prod_lote ON pallet_status(id_producto, lote)")
+    # ✅ aplicar client_encoding si viene en config
+    enc = cfg.get("client_encoding")
+    if enc:
+        try:
+            conn.set_client_encoding(enc)
+        except Exception as e:
+            # No frenamos toda la app por encoding, pero lo avisamos
+            raise RuntimeError(f"Conectó a PG pero falló client_encoding='{enc}': {e}")
 
-    # outbox a sheets
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS sheets_outbox (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        payload TEXT NOT NULL,
-        created_at TEXT NOT NULL
-    )
-    """)
-
-    conn.commit()
     return conn
 
 
+def init_pg(conn):
+    """
+    No recrea tus tablas principales si ya existen.
+    Solo asegura la outbox para Sheets en el schema stock.
+    """
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    outbox = cfg["table_outbox"]
+
+    with conn.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema};")
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {schema}.{outbox} (
+                id BIGSERIAL PRIMARY KEY,
+                payload JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        """)
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{outbox}_created_at ON {schema}.{outbox}(created_at DESC);")
+
+
+def fetch_products(conn):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    prod = cfg["table_products"]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT id_producto, descripcion
+            FROM {schema}.{prod}
+            ORDER BY descripcion ASC;
+        """)
+        return cur.fetchall()
+
+
+def get_product_row(conn, id_producto: int):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    prod = cfg["table_products"]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT id_producto, descripcion, ultimo_nro_serie
+            FROM {schema}.{prod}
+            WHERE id_producto = %s;
+        """, (int(id_producto),))
+        return cur.fetchone()
+
+
+def update_ultimo_nro_serie(conn, id_producto: int, ultimo: int):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    prod = cfg["table_products"]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            UPDATE {schema}.{prod}
+            SET ultimo_nro_serie = %s
+            WHERE id_producto = %s;
+        """, (int(ultimo), int(id_producto)))
+
+
+def insert_stock_pp(conn, id_producto: int, lote: str, serie_inicio: int, serie_fin: int, packs_fin: int):
+    """
+    Inserta un movimiento en stock.stock_pp:
+      - serie_inicio, serie_fin
+      - packs_fin: 0 si completo, >0 si el último es parcial (packs aclarados)
+    """
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tpp = cfg["table_pp"]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            INSERT INTO {schema}.{tpp}(created_at, id_producto, lote, serie_inicio, serie_fin, packs_fin)
+            VALUES (now(), %s, %s, %s, %s, %s)
+            RETURNING id, created_at;
+        """, (int(id_producto), str(lote), int(serie_inicio), int(serie_fin), int(packs_fin)))
+        return cur.fetchone()  # (id, created_at)
+
+
+def fetch_latest_pp(conn, limit=300):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tpp = cfg["table_pp"]
+    prod = cfg["table_products"]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT
+                pp.id,
+                pp.created_at,
+                pp.id_producto,
+                p.descripcion,
+                pp.lote,
+                pp.serie_inicio,
+                pp.serie_fin,
+                pp.packs_fin,
+                ((pp.serie_fin - pp.serie_inicio + 1) - CASE WHEN pp.packs_fin > 0 THEN 1 ELSE 0 END) AS pallets_contados
+            FROM {schema}.{tpp} pp
+            JOIN {schema}.{prod} p ON p.id_producto = pp.id_producto
+            ORDER BY pp.created_at DESC
+            LIMIT %s;
+        """, (int(limit),))
+        return cur.fetchall()
+
+
+def compute_totals_for_product_lote(conn, id_producto: int, lote: str):
+    """
+    Pallets = SUM( (serie_fin-serie_inicio+1) - (packs_fin>0 ? 1 : 0) )
+    Packs  = SUM(packs_fin)
+    """
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tpp = cfg["table_pp"]
+    prod = cfg["table_products"]
+
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT descripcion FROM {schema}.{prod} WHERE id_producto = %s;", (int(id_producto),))
+        row = cur.fetchone()
+        desc = row[0] if row else ""
+
+        cur.execute(f"""
+            SELECT
+                COALESCE(SUM((serie_fin - serie_inicio + 1) - CASE WHEN packs_fin > 0 THEN 1 ELSE 0 END), 0) AS pallets,
+                COALESCE(SUM(packs_fin), 0) AS packs
+            FROM {schema}.{tpp}
+            WHERE id_producto = %s AND lote = %s;
+        """, (int(id_producto), str(lote)))
+        pallets, packs = cur.fetchone()
+
+    return int(pallets), int(packs), str(desc).strip()
+
+
+def build_snapshot_rows(conn):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tpp = cfg["table_pp"]
+    prod = cfg["table_products"]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT
+                p.id_producto,
+                p.descripcion,
+                COALESCE(SUM((pp.serie_fin - pp.serie_inicio + 1) - CASE WHEN pp.packs_fin > 0 THEN 1 ELSE 0 END), 0) AS pallets,
+                COALESCE(SUM(pp.packs_fin), 0) AS packs_aclarados
+            FROM {schema}.{prod} p
+            LEFT JOIN {schema}.{tpp} pp
+              ON pp.id_producto = p.id_producto
+            GROUP BY p.id_producto, p.descripcion
+            ORDER BY p.id_producto ASC;
+        """)
+        rows = cur.fetchall()
+
+    out = []
+    for pid, desc, pallets, packs in rows:
+        out.append({
+            "id_producto": int(pid),
+            "descripcion": str(desc),
+            "pallets": int(pallets),
+            "packs_aclarados": int(packs),
+        })
+    return out
+
+
+# =======================
+#   SHEETS OUTBOX (POSTGRES)
+# =======================
 def outbox_count(conn):
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM sheets_outbox")
-    return int(cur.fetchone()[0])
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    outbox = cfg["table_outbox"]
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {schema}.{outbox};")
+        return int(cur.fetchone()[0] or 0)
 
 
 def queue_outbox(conn, payload: dict):
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO sheets_outbox(payload, created_at) VALUES (?, ?)",
-        (json.dumps(payload, ensure_ascii=False), datetime.now().isoformat(timespec="seconds"))
-    )
-    conn.commit()
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    outbox = cfg["table_outbox"]
+    with conn.cursor() as cur:
+        cur.execute(f"INSERT INTO {schema}.{outbox}(payload) VALUES (%s);", (Json(payload),))
+
+
+def pop_outbox_batch(conn, limit=50):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    outbox = cfg["table_outbox"]
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT id, payload
+            FROM {schema}.{outbox}
+            ORDER BY id ASC
+            LIMIT %s;
+        """, (int(limit),))
+        return cur.fetchall()
+
+
+def delete_outbox_id(conn, rid: int):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    outbox = cfg["table_outbox"]
+    with conn.cursor() as cur:
+        cur.execute(f"DELETE FROM {schema}.{outbox} WHERE id = %s;", (int(rid),))
 
 
 def send_to_sheets(payload: dict):
@@ -191,21 +398,32 @@ def send_to_sheets(payload: dict):
 
 
 def flush_outbox(conn):
-    cur = conn.cursor()
-    cur.execute("SELECT id, payload FROM sheets_outbox ORDER BY id ASC LIMIT 50")
-    rows = cur.fetchall()
-
+    rows = pop_outbox_batch(conn, limit=50)
     sent = 0
-    for rid, payload_str in rows:
-        payload = json.loads(payload_str)
+    for rid, payload in rows:
         res = send_to_sheets(payload)
         if isinstance(res, dict) and res.get("ok") is True:
-            cur.execute("DELETE FROM sheets_outbox WHERE id = ?", (rid,))
-            conn.commit()
+            delete_outbox_id(conn, rid)
             sent += 1
         else:
             break
     return sent
+
+
+def build_payload_for_product_lote(conn, id_producto: int, lote: str):
+    pallets, packs, desc = compute_totals_for_product_lote(conn, id_producto, lote)
+    return {
+        "api_key": SHEETS_API_KEY,
+        "type": "scan_pp",
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "stock": {
+            "id_producto": int(id_producto),
+            "descripcion": desc,
+            "lote": str(lote),
+            "stock_pallets": int(pallets),
+            "stock_packs": int(packs),
+        }
+    }
 
 
 # =======================
@@ -234,7 +452,7 @@ def parse_qr_payload(raw: str) -> dict:
         return {
             "descripcion": data["DSC"],
             "nro_serie": int(data["NS"]),
-            "id_producto": normalize_id_value(data["PRD"]),
+            "id_producto": int(normalize_id_value(data["PRD"])),
             "lote": str(data["LOT"]).strip(),
             "creacion": normalize_date_iso(data["FEC"]),
             "vencimiento": normalize_date_iso(data["VTO"]),
@@ -244,193 +462,20 @@ def parse_qr_payload(raw: str) -> dict:
 
 
 # =======================
-#   GUARDAR SCAN + ESTADO
+#   PDF QRS
 # =======================
-def save_single_scan(conn: sqlite3.Connection, data: dict) -> bool:
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO pallet_scans (descripcion, nro_serie, id_producto, lote, creacion, vencimiento)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            data["descripcion"],
-            int(data["nro_serie"]),
-            data["id_producto"],
-            data["lote"],
-            data["creacion"],
-            data["vencimiento"]
-        ))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-
-
-def upsert_pallet_status(conn: sqlite3.Connection, id_producto: str, lote: str, nro_serie: int, is_full: int, packs_partial: int):
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO pallet_status(id_producto, lote, nro_serie, is_full, packs_partial, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id_producto, lote, nro_serie) DO UPDATE SET
-            is_full = excluded.is_full,
-            packs_partial = excluded.packs_partial,
-            updated_at = excluded.updated_at
-    """, (
-        id_producto, lote, int(nro_serie), int(is_full), int(packs_partial),
-        datetime.now().isoformat(timespec="seconds")
-    ))
-    conn.commit()
-
-
-def fetch_latest_scans(conn: sqlite3.Connection, limit=300):
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT descripcion, nro_serie, id_producto, lote, creacion, vencimiento
-        FROM pallet_scans
-        ORDER BY lote ASC, id_producto ASC, nro_serie ASC
-        LIMIT ?
-    """, (limit,))
-    return cur.fetchall()
-
-
-# =======================
-#   TOTALES PARA SHEETS
-# =======================
-def get_base_desc_for_lote(conn: sqlite3.Connection, id_producto: str, lote: str) -> str:
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT descripcion
-        FROM pallet_scans
-        WHERE id_producto = ? AND lote = ?
-        ORDER BY nro_serie ASC
-        LIMIT 1
-    """, (id_producto, lote))
-    row = cur.fetchone()
-    return (row[0] if row else "").strip()
-
-
-def compute_totals_for_product_lote(conn: sqlite3.Connection, id_producto: str, lote: str):
-    cur = conn.cursor()
-
-    # Pallets: cuenta TODOS los pallets escaneados (completos + parciales)
-    # Si querés solo completos: agregá AND is_full = 1
-    cur.execute("""
-        SELECT COUNT(*)
-        FROM pallet_status
-        WHERE id_producto = ? AND lote = ?
-    """, (id_producto, lote))
-    pallets_total = int(cur.fetchone()[0] or 0)
-
-    # Packs aclarados: suma solo los parciales
-    cur.execute("""
-        SELECT COALESCE(SUM(packs_partial), 0)
-        FROM pallet_status
-        WHERE id_producto = ? AND lote = ? AND is_full = 0
-    """, (id_producto, lote))
-    packs_aclarados = int(cur.fetchone()[0] or 0)
-
-    desc = get_base_desc_for_lote(conn, id_producto, lote)
-
-    return pallets_total, packs_aclarados, desc
-
-
-def build_payload_for_product_lote(conn, id_producto: str, lote: str):
-    pallets_total, packs_aclarados, desc = compute_totals_for_product_lote(conn, id_producto, lote)
-    return {
-        "api_key": SHEETS_API_KEY,
-        "type": "scan",
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "qr": {
-            "id_producto": id_producto,
-            "descripcion": desc,
-            "lote": lote,
-        },
-        "stock": {
-            "id_producto": id_producto,
-            "descripcion": desc,
-            "lote": lote,
-            "stock_total": int(pallets_total),         # pallets
-            "packs_aclarados": int(packs_aclarados)    # packs parciales declarados
-        }
-    }
-
-
-def sync_product_lote_to_sheets(conn, id_producto: str, lote: str):
-    payload = build_payload_for_product_lote(conn, id_producto, lote)
-    queue_outbox(conn, payload)
-    sent = flush_outbox(conn)
-    return sent
-
-
-def build_full_snapshot_rows(conn: sqlite3.Connection):
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT DISTINCT id_producto, lote
-        FROM pallet_scans
-        ORDER BY id_producto ASC, lote ASC
-    """)
-    pairs = cur.fetchall()
-
-    rows = []
-    for pid, lote in pairs:
-        pid = normalize_id_value(pid)
-        lote = str(lote).strip()
-        pallets_total, packs_aclarados, desc = compute_totals_for_product_lote(conn, pid, lote)
-        if pid and lote and desc:
-            rows.append({
-                "id_producto": pid,
-                "lote": lote,
-                "descripcion": desc,
-                "pallets": int(pallets_total),
-                "packs_aclarados": int(packs_aclarados)
-            })
-    return rows
-
-
-def chunks(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
-
-
-# =======================
-#   EXCEL PRODUCTOS
-# =======================
-def cargar_productos():
-    if not os.path.exists(EXCEL_PATH):
-        raise FileNotFoundError(f"No encuentro {EXCEL_PATH}. Debe estar junto al ejecutable/script.")
-    df = pd.read_excel(EXCEL_PATH, sheet_name=HOJA_PRODUCTOS)
-    df.columns = df.columns.str.strip()
-    if "id_producto" in df.columns:
-        df["id_producto"] = df["id_producto"].apply(normalize_id_value)
-    return df
-
-
-def guardar_productos(df):
-    df.to_excel(EXCEL_PATH, sheet_name=HOJA_PRODUCTOS, index=False)
-
-
-def obtener_productos():
-    df = cargar_productos()
-    return list(zip(df["id_producto"], df["descripcion"]))
-
-
 def dividir_texto(texto, max_caracteres):
     return textwrap.wrap(str(texto), width=max_caracteres)
 
 
-# =======================
-#   PDF QRS
-# =======================
-def generar_y_imprimir_qrs(id_producto, descripcion, cantidad):
-    df = cargar_productos()
-    id_producto = normalize_id_value(id_producto)
-
-    fila = df[df["id_producto"] == id_producto].index
-    if fila.empty:
-        messagebox.showerror("Error", "Producto no encontrado.")
+def generar_y_imprimir_qrs(conn, id_producto: int, descripcion: str, cantidad: int):
+    row = get_product_row(conn, id_producto)
+    if not row:
+        messagebox.showerror("Error", "Producto no encontrado en Postgres.")
         return
 
-    nro_serie = int(df.loc[fila[0], "ultimo_nro_serie"])
+    _, _, ultimo = row
+    nro_serie = int(ultimo or 0)
 
     fecha_actual = datetime.now()
     fec_iso = fecha_actual.strftime("%Y-%m-%d")
@@ -475,7 +520,7 @@ def generar_y_imprimir_qrs(id_producto, descripcion, cantidad):
         )
 
         qr = qrcode.make(payload_qr)
-        qr_path = f"temp_qr_{id_producto}_{nro_serie}.png"
+        qr_path = os.path.join(APP_DIR, f"temp_qr_{id_producto}_{nro_serie}.png")
         qr.save(qr_path)
 
         for _ in range(2):
@@ -518,368 +563,435 @@ def generar_y_imprimir_qrs(id_producto, descripcion, cantidad):
                 c.showPage()
                 posicion_actual = 0
 
-        os.remove(qr_path)
+        try:
+            os.remove(qr_path)
+        except:
+            pass
 
     c.save()
 
-    df.loc[fila[0], "ultimo_nro_serie"] = nro_serie
-    guardar_productos(df)
+    # ✅ actualizar ultimo_nro_serie en Postgres
+    update_ultimo_nro_serie(conn, id_producto, nro_serie)
 
     messagebox.showinfo("PDF generado", f"El archivo se guardó correctamente:\n{pdf_path}")
 
 
 # =======================
-#   UI
+#   UI APP
 # =======================
-conn_db = init_db()
-
-root = tb.Window(themename="minty")
-root.title("Sistema QRs – Talca")
-root.geometry("980x650")
-
-notebook = tb.Notebook(root)
-notebook.pack(fill="both", expand=True, padx=10, pady=10)
-
-tab_gen = tb.Frame(notebook, padding=20)
-tab_scan = tb.Frame(notebook, padding=20)
-tab_view = tb.Frame(notebook, padding=20)
-
-notebook.add(tab_gen, text="Generar QRs")
-notebook.add(tab_scan, text="Escanear pallet")
-notebook.add(tab_view, text="Registros")
+def chunks(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
 
 
-# ----- TAB 1: Generar -----
-tb.Label(tab_gen, text="Generador de QRs", font=("Segoe UI", 18, "bold")).pack(pady=10)
-tb.Label(tab_gen, text="Seleccioná un producto:", font=("Segoe UI", 12)).pack(pady=5)
-
-productos = obtener_productos()
-producto_dict = {f"{d} (ID: {i})": (i, d) for i, d in productos}
-
-combo = tb.Combobox(tab_gen, values=list(producto_dict.keys()), width=80)
-combo.pack(pady=4)
-
-tb.Label(tab_gen, text="Cantidad de números de serie:", font=("Segoe UI", 12)).pack(pady=10)
-cantidad_entry = tb.Entry(tab_gen, width=12)
-cantidad_entry.pack()
-
-cache = load_cache()
-if cache.get("gen_producto") in producto_dict:
-    combo.set(cache.get("gen_producto"))
-if cache.get("gen_cantidad"):
-    cantidad_entry.insert(0, str(cache.get("gen_cantidad")))
-
-
-def al_hacer_click_generar():
-    if not combo.get():
-        messagebox.showwarning("Aviso", "Seleccioná un producto.")
-        return
-
+def main():
+    # Conexión PG
     try:
-        cantidad = int(cantidad_entry.get())
-        if cantidad <= 0:
-            raise ValueError
-    except:
-        messagebox.showwarning("Aviso", "Cantidad inválida.")
-        return
-
-    pid, desc = producto_dict[combo.get()]
-    generar_y_imprimir_qrs(pid, desc, cantidad)
-
-    cache2 = load_cache()
-    cache2["gen_producto"] = combo.get()
-    cache2["gen_cantidad"] = cantidad
-    save_cache(cache2)
-
-
-tb.Button(tab_gen, text="GENERAR", bootstyle=SUCCESS, command=al_hacer_click_generar).pack(pady=18)
-
-
-# ----- TAB 3: Registros -----
-tb.Label(tab_view, text="Registros escaneados", font=("Segoe UI", 18, "bold")).pack(pady=10)
-
-count_var = tb.StringVar(value="Cargando…")
-tb.Label(tab_view, textvariable=count_var, font=("Segoe UI", 11)).pack(pady=(0, 8))
-
-table_frame = tb.Frame(tab_view)
-table_frame.pack(fill="both", expand=True)
-
-columns = ("descripcion", "nro_serie", "id_producto", "lote", "creacion", "vencimiento")
-tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=16)
-tree.pack(side="left", fill="both", expand=True)
-
-tree.heading("descripcion", text="Descripción")
-tree.heading("nro_serie", text="N° Serie")
-tree.heading("id_producto", text="ID Producto")
-tree.heading("lote", text="Lote")
-tree.heading("creacion", text="Creación")
-tree.heading("vencimiento", text="Vencimiento")
-
-tree.column("descripcion", width=420, anchor="w")
-tree.column("nro_serie", width=90, anchor="center")
-tree.column("id_producto", width=110, anchor="center")
-tree.column("lote", width=90, anchor="center")
-tree.column("creacion", width=120, anchor="center")
-tree.column("vencimiento", width=120, anchor="center")
-
-scroll_y = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
-scroll_y.pack(side="right", fill="y")
-tree.configure(yscrollcommand=scroll_y.set)
-
-
-def refresh_table(limit=300):
-    for item in tree.get_children():
-        tree.delete(item)
-
-    rows = fetch_latest_scans(conn_db, limit=limit)
-    for r in rows:
-        tree.insert("", "end", values=r)
-
-    count_var.set(f"Mostrando {len(rows)} registros (ordenados por lote/producto/serie)")
-
-
-btns_frame = tb.Frame(tab_view)
-btns_frame.pack(pady=10)
-
-tb.Button(btns_frame, text="Refrescar", bootstyle=INFO, command=refresh_table).pack(side="left", padx=6)
-tb.Button(btns_frame, text="Últimos 100", bootstyle=SECONDARY, command=lambda: refresh_table(100)).pack(side="left", padx=6)
-tb.Button(btns_frame, text="Últimos 500", bootstyle=SECONDARY, command=lambda: refresh_table(500)).pack(side="left", padx=6)
-
-refresh_table()
-
-
-# ----- TAB 2: ESCANEO (toggle parcial) -----
-tb.Label(tab_scan, text="Escaneo de pallets", font=("Segoe UI", 18, "bold")).pack(pady=10)
-tb.Label(
-    tab_scan,
-    text="• Escaneá en el campo.\n"
-         "• Si el toggle 'Pallet parcial' está OFF: se registra como COMPLETO y se envía automático.\n"
-         "• Si el toggle está ON: aparece Packs -> cargás packs y con Enter se envía.\n",
-    font=("Segoe UI", 10),
-    justify="left"
-).pack(pady=6)
-
-scan_var = tb.StringVar()
-entry_scan = tb.Entry(tab_scan, textvariable=scan_var, width=95, font=("Segoe UI", 14))
-entry_scan.pack(pady=10)
-entry_scan.focus_set()
-
-# Toggle: OFF = completo / ON = parcial
-is_partial_var = tb.BooleanVar(value=False)
-
-toggle_frame = tb.Frame(tab_scan)
-toggle_frame.pack(pady=6)
-
-toggle_partial = tb.Checkbutton(
-    toggle_frame,
-    text="Pallet parcial (activar = parcial)",
-    variable=is_partial_var,
-    bootstyle="warning-round-toggle"
-)
-toggle_partial.pack()
-
-packs_frame = tb.Frame(tab_scan)
-packs_frame.pack(pady=8)
-
-tb.Label(packs_frame, text="Packs (solo si parcial):", font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
-packs_var = tb.StringVar(value="")
-entry_packs = tb.Entry(packs_frame, textvariable=packs_var, width=10, font=("Segoe UI", 12))
-entry_packs.pack(side="left")
-
-status_var = tb.StringVar(value="Listo para escanear…")
-status_lbl = tb.Label(tab_scan, textvariable=status_var, font=("Segoe UI", 11), justify="left")
-status_lbl.pack(pady=8)
-
-sheets_var = tb.StringVar(value=f"Sheets pendientes (outbox): {outbox_count(conn_db)}")
-tb.Label(tab_scan, textvariable=sheets_var, font=("Segoe UI", 10)).pack(pady=4)
-
-pending_data = {"data": None}  # scan pendiente (si parcial, queda esperando packs)
-
-
-def show_or_hide_packs():
-    if is_partial_var.get():
-        entry_packs.configure(state="normal")
-        packs_var.set("")
-        # si ya hay un scan pendiente, mandamos foco al packs; sino, al scan
-        if pending_data["data"] is not None:
-            entry_packs.focus_set()
-        else:
-            entry_scan.focus_set()
-    else:
-        entry_packs.configure(state="disabled")
-        packs_var.set("")
-        entry_scan.focus_set()
-
-
-def clear_pending():
-    pending_data["data"] = None
-    scan_var.set("")
-    packs_var.set("")
-    show_or_hide_packs()
-    entry_scan.focus_set()
-
-
-def commit_scan(is_full: int, packs_partial: int):
-    data = pending_data["data"]
-    if not data:
-        return
-
-    save_single_scan(conn_db, data)
-
-    upsert_pallet_status(
-        conn_db,
-        id_producto=data["id_producto"],
-        lote=data["lote"],
-        nro_serie=data["nro_serie"],
-        is_full=1 if is_full else 0,
-        packs_partial=int(packs_partial) if not is_full else 0
-    )
-
-    pallets_total, packs_aclarados, _ = compute_totals_for_product_lote(conn_db, data["id_producto"], data["lote"])
-
-    try:
-        sent = sync_product_lote_to_sheets(conn_db, data["id_producto"], data["lote"])
-        pending = outbox_count(conn_db)
-        sheets_var.set(f"✅ Enviado(s): {sent} | Pendientes (outbox): {pending}")
+        conn_pg = pg_connect()
+        init_pg(conn_pg)
     except Exception as e:
-        pending = outbox_count(conn_db)
-        sheets_var.set(f"⚠️ No se pudo enviar a Sheets: {e} | Pendientes (outbox): {pending}")
+        messagebox.showerror(
+            "PostgreSQL",
+            "No pude conectar a PostgreSQL.\n\n"
+            f"Error: {e}\n\n"
+            "Tip: revisá host/puerto/db/user/pass en config.json (sección pg).\n"
+            "Si usás client_encoding, asegurate que sea válido (ej: WIN1252)."
+        )
+        return
+
+    # Carga productos
+    try:
+        productos = fetch_products(conn_pg)
+    except Exception as e:
+        messagebox.showerror("PostgreSQL", f"No pude leer stock.productos.\n\n{e}")
+        return
+
+    # UI
+    root = tb.Window(themename="minty")
+    root.title("Sistema QRs – Talca (PostgreSQL)")
+    root.geometry("1050x680")
+
+    notebook = tb.Notebook(root)
+    notebook.pack(fill="both", expand=True, padx=10, pady=10)
+
+    tab_gen = tb.Frame(notebook, padding=20)
+    tab_scan = tb.Frame(notebook, padding=20)
+    tab_view = tb.Frame(notebook, padding=20)
+
+    notebook.add(tab_gen, text="Generar QRs")
+    notebook.add(tab_scan, text="Escanear (inicio/fin)")
+    notebook.add(tab_view, text="Registros")
+
+    # -----------------------
+    # TAB 1: Generar
+    # -----------------------
+    tb.Label(tab_gen, text="Generador de QRs", font=("Segoe UI", 18, "bold")).pack(pady=10)
+    tb.Label(tab_gen, text="Seleccioná un producto:", font=("Segoe UI", 12)).pack(pady=5)
+
+    producto_dict = {f"{desc} (ID: {pid})": (int(pid), str(desc)) for pid, desc in productos}
+
+    combo = tb.Combobox(tab_gen, values=list(producto_dict.keys()), width=90)
+    combo.pack(pady=4)
+
+    tb.Label(tab_gen, text="Cantidad de números de serie:", font=("Segoe UI", 12)).pack(pady=10)
+    cantidad_entry = tb.Entry(tab_gen, width=12)
+    cantidad_entry.pack()
+
+    cache = load_cache()
+    if cache.get("gen_producto") in producto_dict:
+        combo.set(cache.get("gen_producto"))
+    if cache.get("gen_cantidad"):
+        try:
+            cantidad_entry.insert(0, str(int(cache.get("gen_cantidad"))))
+        except:
+            pass
+
+    def al_hacer_click_generar():
+        if not combo.get():
+            messagebox.showwarning("Aviso", "Seleccioná un producto.")
+            return
+
+        try:
+            cantidad = int(cantidad_entry.get())
+            if cantidad <= 0:
+                raise ValueError
+        except:
+            messagebox.showwarning("Aviso", "Cantidad inválida.")
+            return
+
+        pid, desc = producto_dict[combo.get()]
+        generar_y_imprimir_qrs(conn_pg, pid, desc, cantidad)
+
+        cache2 = load_cache()
+        cache2["gen_producto"] = combo.get()
+        cache2["gen_cantidad"] = cantidad
+        save_cache(cache2)
+
+    tb.Button(tab_gen, text="GENERAR", bootstyle=SUCCESS, command=al_hacer_click_generar).pack(pady=18)
+
+    # -----------------------
+    # TAB 3: Registros (stock_pp)
+    # -----------------------
+    tb.Label(tab_view, text="Movimientos guardados (stock_pp)", font=("Segoe UI", 18, "bold")).pack(pady=10)
+
+    count_var = tb.StringVar(value="Cargando…")
+    tb.Label(tab_view, textvariable=count_var, font=("Segoe UI", 11)).pack(pady=(0, 8))
+
+    table_frame = tb.Frame(tab_view)
+    table_frame.pack(fill="both", expand=True)
+
+    columns = ("id", "created_at", "id_producto", "descripcion", "lote", "serie_inicio", "serie_fin", "packs_fin", "pallets_contados")
+    tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=18)
+    tree.pack(side="left", fill="both", expand=True)
+
+    headings = {
+        "id": "ID",
+        "created_at": "Fecha",
+        "id_producto": "ID Producto",
+        "descripcion": "Descripción",
+        "lote": "Lote",
+        "serie_inicio": "Serie inicio",
+        "serie_fin": "Serie fin",
+        "packs_fin": "Packs fin",
+        "pallets_contados": "Pallets contados",
+    }
+    for k, h in headings.items():
+        tree.heading(k, text=h)
+
+    tree.column("id", width=60, anchor="center")
+    tree.column("created_at", width=150, anchor="center")
+    tree.column("id_producto", width=110, anchor="center")
+    tree.column("descripcion", width=360, anchor="w")
+    tree.column("lote", width=90, anchor="center")
+    tree.column("serie_inicio", width=95, anchor="center")
+    tree.column("serie_fin", width=95, anchor="center")
+    tree.column("packs_fin", width=85, anchor="center")
+    tree.column("pallets_contados", width=120, anchor="center")
+
+    scroll_y = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+    scroll_y.pack(side="right", fill="y")
+    tree.configure(yscrollcommand=scroll_y.set)
+
+    def refresh_table(limit=300):
+        for item in tree.get_children():
+            tree.delete(item)
+
+        rows = fetch_latest_pp(conn_pg, limit=limit)
+        for r in rows:
+            rid, created_at, pid, desc, lote, si, sf, packs, pallets = r
+            tree.insert("", "end", values=(
+                rid,
+                created_at.strftime("%Y-%m-%d %H:%M:%S") if hasattr(created_at, "strftime") else str(created_at),
+                pid, desc, lote, si, sf, packs, pallets
+            ))
+
+        count_var.set(f"Mostrando {len(rows)} movimientos (ordenados por fecha desc)")
+
+    btns_frame = tb.Frame(tab_view)
+    btns_frame.pack(pady=10)
+
+    tb.Button(btns_frame, text="Refrescar", bootstyle=INFO, command=refresh_table).pack(side="left", padx=6)
+    tb.Button(btns_frame, text="Últimos 100", bootstyle=SECONDARY, command=lambda: refresh_table(100)).pack(side="left", padx=6)
+    tb.Button(btns_frame, text="Últimos 500", bootstyle=SECONDARY, command=lambda: refresh_table(500)).pack(side="left", padx=6)
 
     refresh_table()
 
-    tipo = "COMPLETO" if is_full else f"PARCIAL ({packs_partial} packs)"
-    status_var.set(
-        f"✅ Registrado {tipo}\n"
-        f"{data['id_producto']} | Lote {data['lote']} | Serie {data['nro_serie']}\n"
-        f"📦 Pallets (según escaneos): {pallets_total}\n"
-        f"📦 Packs aclarados (parciales): {packs_aclarados}"
+    # -----------------------
+    # TAB 2: Escaneo (inicio/fin) + parcial
+    # -----------------------
+    tb.Label(tab_scan, text="Escaneo por rango", font=("Segoe UI", 18, "bold")).pack(pady=10)
+    tb.Label(
+        tab_scan,
+        text="Escaneá el QR de INICIO y luego el QR de FIN.\n"
+             "Si el ÚLTIMO pallet es parcial, activá el toggle y cargá packs.",
+        font=("Segoe UI", 10)
+    ).pack(pady=6)
+
+    scan_var = tb.StringVar()
+    entry_scan = tb.Entry(tab_scan, textvariable=scan_var, width=95, font=("Segoe UI", 14))
+    entry_scan.pack(pady=10)
+    entry_scan.focus_set()
+
+    is_partial_var = tb.BooleanVar(value=False)
+
+    toggle_frame = tb.Frame(tab_scan)
+    toggle_frame.pack(pady=6)
+
+    toggle_partial = tb.Checkbutton(
+        toggle_frame,
+        text="Último pallet parcial (activar = parcial)",
+        variable=is_partial_var,
+        bootstyle="warning-round-toggle"
     )
-    root.bell()
-    clear_pending()
+    toggle_partial.pack()
 
+    packs_frame = tb.Frame(tab_scan)
+    packs_frame.pack(pady=8)
 
-def on_scan_return(event=None):
-    raw = scan_var.get().strip()
-    if not raw:
-        return
+    tb.Label(packs_frame, text="Packs del último pallet parcial:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
+    packs_var = tb.StringVar(value="")
+    entry_packs = tb.Entry(packs_frame, textvariable=packs_var, width=10, font=("Segoe UI", 12))
+    entry_packs.pack(side="left")
 
-    try:
-        data = parse_qr_payload(raw)
-        pending_data["data"] = data
+    status_var = tb.StringVar(value="🟢 Listo: escaneá QR de INICIO y presioná Enter.")
+    tb.Label(tab_scan, textvariable=status_var, font=("Segoe UI", 11), justify="left").pack(pady=10)
 
-        if not is_partial_var.get():
-            # COMPLETO -> enviar automático
-            commit_scan(is_full=1, packs_partial=0)
+    sheets_var = tb.StringVar(value=f"Sheets pendientes (outbox): {outbox_count(conn_pg)}")
+    tb.Label(tab_scan, textvariable=sheets_var, font=("Segoe UI", 10)).pack(pady=4)
+
+    flow = {"start": None, "end": None, "await": "start"}  # start | end | packs
+
+    def ui_set_packs_state():
+        if is_partial_var.get():
+            entry_packs.configure(state="normal")
         else:
-            # PARCIAL -> esperar packs + Enter
-            status_var.set(
-                f"🟡 Parcial: ingresá packs y presioná Enter.\n"
-                f"{data['id_producto']} | Lote {data['lote']} | Serie {data['nro_serie']}"
-            )
-            entry_packs.focus_set()
+            entry_packs.configure(state="disabled")
+            packs_var.set("")
 
-    except Exception as e:
-        status_var.set(f"❌ ERROR scan: {e}")
-        root.bell()
-        clear_pending()
-
-
-def on_packs_return(event=None):
-    if pending_data["data"] is None:
+    def reset_flow():
+        flow["start"] = None
+        flow["end"] = None
+        flow["await"] = "start"
+        scan_var.set("")
+        packs_var.set("")
+        ui_set_packs_state()
+        status_var.set("🟢 Listo: escaneá QR de INICIO y presioná Enter.")
         entry_scan.focus_set()
-        return
 
-    # Si alguien apagó el toggle antes de Enter, entonces ahora sería completo y se manda
-    if not is_partial_var.get():
-        commit_scan(is_full=1, packs_partial=0)
-        return
-
-    try:
-        packs = int(packs_var.get())
-        if packs < 1:
-            raise ValueError
-    except:
-        status_var.set("❌ Packs inválido. Debe ser entero >= 1.")
-        root.bell()
-        entry_packs.focus_set()
-        return
-
-    commit_scan(is_full=0, packs_partial=packs)
-
-
-def on_toggle_changed(*args):
-    show_or_hide_packs()
-
-    # Si hay scan pendiente y se apagó (completo), mandamos automático
-    if pending_data["data"] is not None and not is_partial_var.get():
-        commit_scan(is_full=1, packs_partial=0)
-
-
-is_partial_var.trace_add("write", on_toggle_changed)
-
-entry_scan.bind("<Return>", on_scan_return)
-entry_packs.bind("<Return>", on_packs_return)
-
-show_or_hide_packs()
-
-
-def retry_sync_full_snapshot():
-    try:
-        sent_pending = flush_outbox(conn_db)
-
-        all_rows = build_full_snapshot_rows(conn_db)
-        if not all_rows:
-            pending = outbox_count(conn_db)
-            messagebox.showinfo("Sync Sheets", f"No hay datos en la BD.\nEnviados pendientes: {sent_pending}\nPendientes: {pending}")
-            sheets_var.set(f"Sheets pendientes (outbox): {pending}")
+    def commit_range(packs_fin: int):
+        start = flow["start"]
+        end = flow["end"]
+        if not start or not end:
             return
 
-        total = 0
-        for block in chunks(all_rows, 200):
-            payload = {
-                "api_key": SHEETS_API_KEY,
-                "type": "bulk_snapshot",
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "rows": block
-            }
-            res = send_to_sheets(payload)
-            if not isinstance(res, dict) or res.get("ok") is not True:
-                raise RuntimeError(f"Respuesta inválida de Sheets: {res}")
-            total += len(block)
+        if int(start["id_producto"]) != int(end["id_producto"]) or str(start["lote"]) != str(end["lote"]):
+            raise ValueError("INICIO y FIN no corresponden al mismo producto+lote.")
 
-        pending = outbox_count(conn_db)
-        sheets_var.set(f"✅ Snapshot enviado ({total} filas). Pendientes (outbox): {pending}")
-        messagebox.showinfo("Sync Sheets", f"✅ Snapshot completo enviado.\nFilas enviadas: {total}\nPendientes (outbox): {pending}")
+        pid = int(start["id_producto"])
+        lote = str(start["lote"]).strip()
 
-    except Exception as e:
-        messagebox.showerror("Sync Sheets", f"Error:\n{e}")
+        si = int(start["nro_serie"])
+        sf = int(end["nro_serie"])
+        serie_inicio = min(si, sf)
+        serie_fin = max(si, sf)
 
+        mov_id, created_at = insert_stock_pp(conn_pg, pid, lote, serie_inicio, serie_fin, int(packs_fin))
 
-btn_frame_scan = tb.Frame(tab_scan)
-btn_frame_scan.pack(pady=10)
+        pallets_total, packs_total, desc = compute_totals_for_product_lote(conn_pg, pid, lote)
 
-tb.Button(btn_frame_scan, text="Reintentar envío a Sheets", bootstyle=WARNING, command=retry_sync_full_snapshot).pack(side="left", padx=6)
+        try:
+            payload = build_payload_for_product_lote(conn_pg, pid, lote)
+            queue_outbox(conn_pg, payload)
+            sent = flush_outbox(conn_pg)
+            pending = outbox_count(conn_pg)
+            sheets_var.set(f"✅ Enviado(s): {sent} | Pendientes (outbox): {pending}")
+        except Exception as e:
+            pending = outbox_count(conn_pg)
+            sheets_var.set(f"⚠️ No se pudo enviar a Sheets: {e} | Pendientes (outbox): {pending}")
 
+        refresh_table()
+        root.bell()
 
-def on_tab_change(event=None):
-    try:
-        current = notebook.tab(notebook.select(), "text")
-        if current == "Escanear pallet":
+        rango_total = (serie_fin - serie_inicio + 1)
+        pallets_mov = rango_total - (1 if packs_fin > 0 else 0)
+
+        tipo = "COMPLETO" if packs_fin <= 0 else f"PARCIAL (packs: {packs_fin})"
+        status_var.set(
+            f"✅ Movimiento guardado ({tipo})\n"
+            f"ID {mov_id} | {pid} | {desc}\n"
+            f"Lote {lote} | Series {serie_inicio}–{serie_fin} (rango {rango_total})\n"
+            f"📦 Pallets en este movimiento: {pallets_mov}\n"
+            f"📦 Stock total pallets (producto+lote): {pallets_total}\n"
+            f"📦 Stock total packs (producto+lote): {packs_total}"
+        )
+
+        reset_flow()
+
+    def on_scan_return(event=None):
+        raw = scan_var.get().strip()
+        if not raw:
+            return
+        scan_var.set("")
+
+        try:
+            data = parse_qr_payload(raw)
+
+            if flow["await"] == "start":
+                flow["start"] = data
+                flow["await"] = "end"
+                status_var.set(
+                    f"🟡 INICIO OK: {data['id_producto']} | Lote {data['lote']} | Serie {data['nro_serie']}\n"
+                    f"Ahora escaneá el QR de FIN y Enter."
+                )
+                entry_scan.focus_set()
+                return
+
+            if flow["await"] == "end":
+                flow["end"] = data
+
+                if not is_partial_var.get():
+                    commit_range(packs_fin=0)
+                    return
+
+                flow["await"] = "packs"
+                ui_set_packs_state()
+                status_var.set(
+                    f"🟠 FIN OK: {data['id_producto']} | Lote {data['lote']} | Serie {data['nro_serie']}\n"
+                    f"Último es PARCIAL: escribí packs y presioná Enter."
+                )
+                entry_packs.focus_set()
+                return
+
+            status_var.set("⚠️ Estás en modo packs. Ingresá packs y Enter, o apagá el toggle para enviar como completo.")
+            entry_packs.focus_set()
+
+        except Exception as e:
+            status_var.set(f"❌ ERROR scan: {e}")
+            root.bell()
+            reset_flow()
+
+    def on_packs_return(event=None):
+        if flow["await"] != "packs":
             entry_scan.focus_set()
-    except:
-        pass
+            return
+
+        if not is_partial_var.get():
+            try:
+                commit_range(packs_fin=0)
+            except Exception as e:
+                status_var.set(f"❌ ERROR: {e}")
+                root.bell()
+                reset_flow()
+            return
+
+        try:
+            packs = int(packs_var.get())
+            if packs < 1:
+                raise ValueError
+        except:
+            status_var.set("❌ Packs inválido. Debe ser entero >= 1.")
+            root.bell()
+            entry_packs.focus_set()
+            return
+
+        try:
+            commit_range(packs_fin=packs)
+        except Exception as e:
+            status_var.set(f"❌ ERROR: {e}")
+            root.bell()
+            reset_flow()
+
+    def on_toggle_changed(*args):
+        ui_set_packs_state()
+        if flow["await"] == "packs" and not is_partial_var.get():
+            try:
+                commit_range(packs_fin=0)
+            except Exception as e:
+                status_var.set(f"❌ ERROR: {e}")
+                root.bell()
+                reset_flow()
+
+    is_partial_var.trace_add("write", on_toggle_changed)
+
+    entry_scan.bind("<Return>", on_scan_return)
+    entry_packs.bind("<Return>", on_packs_return)
+    ui_set_packs_state()
+
+    def retry_sync_snapshot():
+        try:
+            sent_pending = flush_outbox(conn_pg)
+
+            rows = build_snapshot_rows(conn_pg)
+            if not rows:
+                pending = outbox_count(conn_pg)
+                messagebox.showinfo("Sync Sheets", f"No hay datos en stock_pp.\nEnviados pendientes: {sent_pending}\nPendientes: {pending}")
+                sheets_var.set(f"Sheets pendientes (outbox): {pending}")
+                return
+
+            total_sent = 0
+            for block in chunks(rows, 200):
+                payload = {
+                    "api_key": SHEETS_API_KEY,
+                    "type": "bulk_snapshot_pp",
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "rows": block
+                }
+                res = send_to_sheets(payload)
+                if not isinstance(res, dict) or res.get("ok") is not True:
+                    raise RuntimeError(f"Respuesta inválida de Sheets: {res}")
+                total_sent += len(block)
+
+            pending = outbox_count(conn_pg)
+            sheets_var.set(f"✅ Snapshot enviado ({total_sent} filas). Pendientes (outbox): {pending}")
+            messagebox.showinfo("Sync Sheets", f"✅ Snapshot completo enviado.\nFilas enviadas: {total_sent}\nPendientes (outbox): {pending}")
+
+        except Exception as e:
+            messagebox.showerror("Sync Sheets", f"Error:\n{e}")
+
+    btn_frame_scan = tb.Frame(tab_scan)
+    btn_frame_scan.pack(pady=10)
+    tb.Button(btn_frame_scan, text="Reintentar envío a Sheets (snapshot)", bootstyle=WARNING, command=retry_sync_snapshot).pack(side="left", padx=6)
+
+    def on_tab_change(event=None):
+        try:
+            current = notebook.tab(notebook.select(), "text")
+            if current == "Escanear (inicio/fin)":
+                entry_scan.focus_set()
+        except:
+            pass
+
+    notebook.bind("<<NotebookTabChanged>>", on_tab_change)
+
+    def on_close():
+        try:
+            conn_pg.close()
+        except:
+            pass
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.mainloop()
 
 
-notebook.bind("<<NotebookTabChanged>>", on_tab_change)
-
-
-def on_close():
-    try:
-        conn_db.close()
-    except:
-        pass
-    root.destroy()
-
-
-root.protocol("WM_DELETE_WINDOW", on_close)
-root.mainloop()
+if __name__ == "__main__":
+    main()
